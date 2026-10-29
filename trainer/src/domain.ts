@@ -46,7 +46,7 @@ export type Progress = {
   total: number;
 };
 
-function isAnswerFilled(answer: Answer): boolean {
+export function isAnswerFilled(answer: Answer): boolean {
   if (answer.kind === "single-choice") {
     return answer.optionId !== "";
   }
@@ -67,4 +67,22 @@ export function computeProgress(set: TrainingSet, answers: Answer[]): Progress {
   ).length;
 
   return { answered, total: set.tasks.length };
+}
+
+export function findAnswer(answers: Answer[], taskId: string): Answer | undefined {
+  return answers.find((answer) => answer.taskId === taskId);
+}
+
+/** Возвращает новую коллекцию: у одного Task.id всегда не более одного актуального ответа. */
+export function upsertAnswer(answers: Answer[], next: Answer): Answer[] {
+  const rest = answers.filter((answer) => answer.taskId !== next.taskId);
+  return [...rest, next];
+}
+
+/** Задания без заполненного ответа, в порядке модуля. Единственный источник правды для пропусков. */
+export function getMissingTasks(set: TrainingSet, answers: Answer[]): Task[] {
+  return set.tasks.filter((task) => {
+    const answer = findAnswer(answers, task.id);
+    return answer === undefined || !isAnswerFilled(answer);
+  });
 }
