@@ -1,17 +1,26 @@
-import { useState } from "react";
+import { useReducer, useState } from "react";
 import {
   computeProgress,
   findAnswer,
   getMissingTasks,
   getTaskById,
-  upsertAnswer,
+  isAnswerFilled,
   type Answer,
   type Task,
 } from "./domain";
+import { createAttempt, reduceAttempt, type AttemptAction } from "./attempt";
 import { mainSet } from "./training-data";
 import "./App.css";
 
-type AttemptStatus = "in-progress" | "submitted";
+type View = "tasks" | "overview";
+
+// Reducer связывает React с чистыми правилами из attempt.ts.
+function attemptReducer(
+  attempt: ReturnType<typeof createAttempt>,
+  action: AttemptAction,
+) {
+  return reduceAttempt(mainSet, attempt, action);
+}
 
 type TaskListProps = {
   tasks: Task[];
@@ -48,9 +57,10 @@ type TaskCardProps = {
   task: Task;
   answer: Answer | undefined;
   onAnswer: (answer: Answer) => void;
+  onClear: () => void;
 };
 
-function TaskCard({ task, answer, onAnswer }: TaskCardProps) {
+function TaskCard({ task, answer, onAnswer, onClear }: TaskCardProps) {
   const selectedOptionId =
     answer?.kind === "single-choice" ? answer.optionId : "";
   const text = answer?.kind === "short-text" ? answer.text : "";
@@ -108,17 +118,26 @@ function TaskCard({ task, answer, onAnswer }: TaskCardProps) {
           />
         </label>
       )}
+
+      <div className="card-actions">
+        <button type="button" onClick={onClear} disabled={answer === undefined}>
+          Очистить ответ
+        </button>
+      </div>
     </article>
   );
 }
 
-type ReviewProps = {
+type OverviewProps = {
   answers: Answer[];
+  editable: boolean;
+  onOpen: (taskId: string) => void;
+  onClear: (taskId: string) => void;
   onRestart: () => void;
 };
 
 function describeAnswer(task: Task, answer: Answer | undefined): string {
-  if (answer === undefined) return "";
+  if (answer === undefined || !isAnswerFilled(answer)) return "";
   if (answer.kind === "single-choice" && task.kind === "single-choice") {
     return task.options.find((option) => option.id === answer.optionId)?.label ?? "";
   }
@@ -128,19 +147,24 @@ function describeAnswer(task: Task, answer: Answer | undefined): string {
   return "";
 }
 
-function Review({ answers, onRestart }: ReviewProps) {
+// Один и тот же обзор до и после завершения: кнопки действий есть только пока попытка открыта.
+function Overview({ answers, editable, onOpen, onClear, onRestart }: OverviewProps) {
   const progress = computeProgress(mainSet, answers);
 
   return (
     <section className="card review">
-      <p className="meta">Попытка завершена</p>
+      <p className="meta">{editable ? "Обзор попытки" : "Попытка завершена"}</p>
       <h2>Обзор ответов</h2>
       <p>
-        Заполнено {progress.answered} из {progress.total}. Редактирование закрыто.
+        Заполнено {progress.answered} из {progress.total}.{" "}
+        {editable
+          ? "Ответ можно очистить прямо отсюда."
+          : "Редактирование закрыто."}
       </p>
       <ol className="review-list">
         {mainSet.tasks.map((task) => {
-          const value = describeAnswer(task, findAnswer(answers, task.id));
+          const answer = findAnswer(answers, task.id);
+          const value = describeAnswer(task, answer);
           return (
             <li key={task.id}>
               <strong>{task.prompt}</strong>
@@ -154,27 +178,50 @@ function Review({ answers, onRestart }: ReviewProps) {
               ) : (
                 <p className="review-answer">{value}</p>
               )}
+              {editable && (
+                <div className="review-actions">
+                  <button type="button" onClick={() => onOpen(task.id)}>
+                    Открыть задание
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onClear(task.id)}
+                    disabled={answer === undefined}
+                  >
+                    Очистить ответ
+                  </button>
+                </div>
+              )}
             </li>
           );
         })}
       </ol>
-      <button type="button" className="primary" onClick={onRestart}>
-        Начать новую попытку
-      </button>
+      {!editable && (
+        <button type="button" className="primary" onClick={onRestart}>
+          Начать новую попытку
+        </button>
+      )}
     </section>
   );
 }
 
 export default function App() {
-  const [answers, setAnswers] = useState<Answer[]>([]);
+  // Одна попытка (ответы и статус) у одного владельца. Все действия идут через dispatch.
+  const [attempt, dispatch] = useReducer(attemptReducer, createAttempt());
+  // Местные детали интерфейса: какое задание открыто и что показано, карточка или обзор.
   const [selectedId, setSelectedId] = useState<string>(mainSet.tasks[0]?.id ?? "");
-  const [status, setStatus] = useState<AttemptStatus>("in-progress");
+  const [view, setView] = useState<View>("tasks");
 
+  const answers = attempt.answers;
   const selectedTask = getTaskById(mainSet, selectedId);
   const selectedIndex = mainSet.tasks.findIndex((task) => task.id === selectedId);
 
+  // Производные значения: считаются из answers, отдельно не хранятся.
   const progress = computeProgress(mainSet, answers);
   const missing = getMissingTasks(mainSet, answers);
+  const missingNumbers = missing
+    .map((task) => mainSet.tasks.findIndex((t) => t.id === task.id) + 1)
+    .join(", ");
 
   function goTo(index: number) {
     const target = mainSet.tasks[index];
@@ -183,21 +230,23 @@ export default function App() {
 
   function handleFinish() {
     if (missing.length > 0) {
-      const numbers = missing
-        .map((task) => mainSet.tasks.findIndex((t) => t.id === task.id) + 1)
-        .join(", ");
       const confirmed = window.confirm(
-        `Не заполнены задания: ${numbers}. Завершить попытку?`,
+        `Не заполнены задания: ${missingNumbers}. Завершить попытку?`,
       );
       if (!confirmed) return;
     }
-    setStatus("submitted");
+    dispatch({ type: "finish" });
   }
 
   function handleRestart() {
-    setAnswers([]);
+    dispatch({ type: "restart" });
     setSelectedId(mainSet.tasks[0]?.id ?? "");
-    setStatus("in-progress");
+    setView("tasks");
+  }
+
+  function handleOpenFromOverview(taskId: string) {
+    setSelectedId(taskId);
+    setView("tasks");
   }
 
   if (mainSet.tasks.length === 0) {
@@ -209,11 +258,17 @@ export default function App() {
     );
   }
 
-  if (status === "submitted") {
+  if (attempt.status === "submitted") {
     return (
       <main className="app">
         <h1>{mainSet.title}</h1>
-        <Review answers={answers} onRestart={handleRestart} />
+        <Overview
+          answers={answers}
+          editable={false}
+          onOpen={handleOpenFromOverview}
+          onClear={(taskId) => dispatch({ type: "clear", taskId })}
+          onRestart={handleRestart}
+        />
       </main>
     );
   }
@@ -230,53 +285,86 @@ export default function App() {
         <p className="missing" aria-live="polite">
           {missing.length === 0
             ? "Все задания заполнены."
-            : `Не заполнены: ${missing
-                .map((task) => mainSet.tasks.findIndex((t) => t.id === task.id) + 1)
-                .join(", ")}`}
+            : `Не заполнены: ${missingNumbers}`}
         </p>
       </div>
 
-      <div className="layout">
-        <TaskList
-          tasks={mainSet.tasks}
-          answers={answers}
-          selectedId={selectedId}
-          onSelect={setSelectedId}
-        />
+      <div className="view-switch">
+        <button
+          type="button"
+          aria-pressed={view === "tasks"}
+          onClick={() => setView("tasks")}
+        >
+          Задания
+        </button>
+        <button
+          type="button"
+          aria-pressed={view === "overview"}
+          onClick={() => setView("overview")}
+        >
+          Обзор ответов
+        </button>
+      </div>
 
-        <div>
-          {selectedTask !== undefined ? (
-            <TaskCard
-              key={selectedTask.id}
-              task={selectedTask}
-              answer={findAnswer(answers, selectedTask.id)}
-              onAnswer={(next) => setAnswers((prev) => upsertAnswer(prev, next))}
-            />
-          ) : (
-            <p>Выберите задание из списка.</p>
-          )}
-
+      {view === "overview" ? (
+        <>
+          <Overview
+            answers={answers}
+            editable={true}
+            onOpen={handleOpenFromOverview}
+            onClear={(taskId) => dispatch({ type: "clear", taskId })}
+            onRestart={handleRestart}
+          />
           <div className="nav">
-            <button
-              type="button"
-              onClick={() => goTo(selectedIndex - 1)}
-              disabled={selectedIndex <= 0}
-            >
-              Назад
-            </button>
-            <button
-              type="button"
-              onClick={() => goTo(selectedIndex + 1)}
-              disabled={selectedIndex >= mainSet.tasks.length - 1}
-            >
-              Далее
-            </button>
             <button type="button" className="primary" onClick={handleFinish}>
               Завершить
             </button>
           </div>
+        </>
+      ) : (
+        <div className="layout">
+          <TaskList
+            tasks={mainSet.tasks}
+            answers={answers}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+          />
+
+          <div>
+            {selectedTask !== undefined ? (
+              <TaskCard
+                key={selectedTask.id}
+                task={selectedTask}
+                answer={findAnswer(answers, selectedTask.id)}
+                onAnswer={(answer) => dispatch({ type: "answer", answer })}
+                onClear={() => dispatch({ type: "clear", taskId: selectedTask.id })}
+              />
+            ) : (
+              <p>Выберите задание из списка.</p>
+            )}
+
+            <div className="nav">
+              <button
+                type="button"
+                onClick={() => goTo(selectedIndex - 1)}
+                disabled={selectedIndex <= 0}
+              >
+                Назад
+              </button>
+              <button
+                type="button"
+                onClick={() => goTo(selectedIndex + 1)}
+                disabled={selectedIndex >= mainSet.tasks.length - 1}
+              >
+                Далее
+              </button>
+              <button type="button" className="primary" onClick={handleFinish}>
+                Завершить
+              </button>
+            </div>
+          </div>
         </div>
-      </div>
+      )}
     </main>
   );
 }
